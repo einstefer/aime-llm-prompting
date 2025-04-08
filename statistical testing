@@ -1,0 +1,132 @@
+import numpy as np
+from statsmodels.stats.contingency_tables import cochrans_q, mcnemar
+from statsmodels.stats.multitest import multipletests
+
+# Section 1: Cochran’s Q Test — Testing All Prompting Styles Together
+
+# Note: Each row below corresponds to a prompt style, and each column is an AIME problem (15 total)
+# Transposing to match shape expected by statsmodels: trials (rows) x conditions (columns)
+free_model_responses = np.array([
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Just the Problem
+    [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Intuition & Insights
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Olympiad Problem & Solution
+    [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # AIME Problem & Just Answer
+    [1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # AIME Problem & Worked Solution
+]).T
+
+# Running Cochran’s Q Test for ChatGPT Free model responses
+q_result_free = cochrans_q(free_model_responses)
+print(f"ChatGPT Free — Q: {q_result_free.statistic:.4f}, p = {q_result_free.pvalue:.4f}")
+
+# Repeat for ChatGPT Premium
+premium_model_responses = np.array([
+    [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+]).T
+q_result_premium = cochrans_q(premium_model_responses)
+print(f"ChatGPT Premium — Q: {q_result_premium.statistic:.4f}, p = {q_result_premium.pvalue:.4f}")
+
+# Gemini model
+# Gemini was observed to behave inconsistently across accounts, so interpret with caution
+# Still useful for inclusion in Q Test to detect broad variance
+
+gemini_model_responses = np.array([
+    [1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+    [1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+]).T
+q_result_gemini = cochrans_q(gemini_model_responses)
+print(f"Gemini — Q: {q_result_gemini.statistic:.4f}, p = {q_result_gemini.pvalue:.4f}")
+
+
+# Section 2: McNemar’s Test — Pairwise Comparison vs. Baseline
+
+
+# Dataset: Accuracy (1 or 0) for each LLM and prompt type across 15 AIME problems
+# Key idea: Compare every prompt type to baseline ("Just the Problem") using McNemar’s Test
+
+llm_accuracy_by_prompt = {
+    "ChatGPT Free": free_model_responses.T.tolist(),
+    "ChatGPT Premium": premium_model_responses.T.tolist(),
+    "Gemini": gemini_model_responses.T.tolist(),
+}
+
+prompt_styles = [
+    "Just the Problem",
+    "Intuition & Insights",
+    "Olympiad Problem & Solution",
+    "AIME Problem & Just Answer",
+    "AIME Problem & Worked Solution",
+]
+
+# Wrap the raw lists into dictionary format for cleaner access
+formatted_llm_data = {
+    model_name: {
+        style: llm_accuracy_by_prompt[model_name][i]
+        for i, style in enumerate(prompt_styles)
+    }
+    for model_name in llm_accuracy_by_prompt
+}
+
+# Function to compare two prompt styles using McNemar's Test
+def compare_prompt_styles(model_name, baseline_prompt, test_prompt):
+    """Constructs contingency table for McNemar’s test between two prompt types."""
+    base = formatted_llm_data[model_name][baseline_prompt]
+    test = formatted_llm_data[model_name][test_prompt]
+    table = np.zeros((2, 2), dtype=int)
+
+    for b, t in zip(base, test):
+        if b == 1 and t == 1:
+            table[1, 1] += 1  # Both correct
+        elif b == 1:
+            table[1, 0] += 1  # Baseline correct, test wrong
+        elif t == 1:
+            table[0, 1] += 1  # Test correct, baseline wrong
+        else:
+            table[0, 0] += 1  # Both wrong
+
+    if table[0, 1] + table[1, 0] == 0:
+        return None, 1.0  # No discordant pairs
+
+    result = mcnemar(table, exact=True)
+    return result.statistic, result.pvalue
+
+# Loop through each LLM and run McNemar’s Test for each alternative prompt style
+pairwise_test_results = {}
+for model_name in formatted_llm_data:
+    pairwise_test_results[model_name] = {}
+    for alt_prompt in prompt_styles:
+        if alt_prompt == "Just the Problem":
+            continue
+        stat, p = compare_prompt_styles(model_name, "Just the Problem", alt_prompt)
+        pairwise_test_results[model_name][alt_prompt] = {"stat": stat, "p": p}
+
+
+# Section 3: Multiple Hypothesis Correction (Bonferroni)
+
+
+# Applying correction across all pairwise comparisons within each LLM
+for model_name in pairwise_test_results:
+    raw_p_vals = [res["p"] for res in pairwise_test_results[model_name].values()]
+    reject, corrected, _, _ = multipletests(raw_p_vals, alpha=0.05, method="bonferroni")
+
+    for (prompt, res), p_corr, r in zip(pairwise_test_results[model_name].items(), corrected, reject):
+        res["p_corrected"] = p_corr
+        res["reject_null"] = r
+
+
+# Section 4: Print Summary
+
+
+print("\nMcNemar’s Test Results with Bonferroni Correction:\n")
+for model_name, results in pairwise_test_results.items():
+    print(f"Model: {model_name}")
+    for prompt, res in results.items():
+        stat_str = "N/A" if res["stat"] is None else f"{res['stat']:.4f}"
+        print(f"  {prompt} — Stat: {stat_str}, Raw p: {res['p']:.4f}, Corrected p: {res['p_corrected']:.4f}, Reject Null: {res['reject_null']}")
+    print()
