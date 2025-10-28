@@ -1,132 +1,266 @@
+"""
+AIME Prompting Style Analysis (Pooled + Per-Exam)
+-------------------------------------------------
+What this script checks and reports:
+
+1) Data sanity:
+   - For every 15-length accuracy vector, make sure the sum matches the provided score.
+   - If anything is off, print the mismatch and stop.
+
+2) Pooled analysis (per model, n = 60 = 4 exams × 15 problems):
+   - Cochran’s Q across the 5 prompt styles.
+   - If you care about direction, also run McNemar for each style vs the baseline ("Just").
+   - Adjust those 4 McNemar p-values with Benjamini–Hochberg (BH).
+
+3) Per-exam view (heterogeneity check):
+   - For each exam, run McNemar (style vs baseline).
+   - Print the discordant counts (b→t and t→b), a simple OR proxy (b→t / t→b), and the exact p-value.
+   - This shows whether pooled directions are consistent across exams.
+
+Notes:
+- McNemar 2×2 table layout:
+      [[both wrong, baseline wrong & test right],
+       [baseline right & test wrong, both right]]
+- b→t = baseline wrong → test right
+- t→b = test wrong → baseline right
+- OR proxy = b→t / t→b (∞ if t→b = 0; None if both are zero)
+"""
+
+import sys
 import numpy as np
+from collections import defaultdict
 from statsmodels.stats.contingency_tables import cochrans_q, mcnemar
 from statsmodels.stats.multitest import multipletests
 
-# Section 1: Cochran’s Q Test — Testing All Prompting Styles Together
-
-# Note: Each row below corresponds to a prompt style, and each column is an AIME problem (15 total)
-# Transposing to match shape expected by statsmodels: trials (rows) x conditions (columns)
-free_model_responses = np.array([
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Just the Problem
-    [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Intuition & Insights
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Olympiad Problem & Solution
-    [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # AIME Problem & Just Answer
-    [1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # AIME Problem & Worked Solution
-]).T
-
-# Running Cochran’s Q Test for ChatGPT Free model responses
-q_result_free = cochrans_q(free_model_responses)
-print(f"ChatGPT Free — Q: {q_result_free.statistic:.4f}, p = {q_result_free.pvalue:.4f}")
-
-# Repeat for ChatGPT Premium
-premium_model_responses = np.array([
-    [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0],
-    [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0],
-    [1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-    [1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0],
-    [1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-]).T
-q_result_premium = cochrans_q(premium_model_responses)
-print(f"ChatGPT Premium — Q: {q_result_premium.statistic:.4f}, p = {q_result_premium.pvalue:.4f}")
-
-# Gemini model
-# Gemini was observed to behave inconsistently across accounts, so interpret with caution
-# Still useful for inclusion in Q Test to detect broad variance
-
-gemini_model_responses = np.array([
-    [1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0],
-    [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-    [1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-]).T
-q_result_gemini = cochrans_q(gemini_model_responses)
-print(f"Gemini — Q: {q_result_gemini.statistic:.4f}, p = {q_result_gemini.pvalue:.4f}")
-
-
-# Section 2: McNemar’s Test — Pairwise Comparison vs. Baseline
-
-
-# Dataset: Accuracy (1 or 0) for each LLM and prompt type across 15 AIME problems
-# Key idea: Compare every prompt type to baseline ("Just the Problem") using McNemar’s Test
-
-llm_accuracy_by_prompt = {
-    "ChatGPT Free": free_model_responses.T.tolist(),
-    "ChatGPT Premium": premium_model_responses.T.tolist(),
-    "Gemini": gemini_model_responses.T.tolist(),
+# ---------------------------
+# 1) Raw data (as provided)
+# ---------------------------
+DATA = {
+    "2025 AIME I": {
+        "Free": [
+            ("Just",     [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0], 1),
+            ("Insights", [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0], 2),
+            ("Olympiad", [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0], 1),
+            ("JustAns",  [1,0,0,0,0,0,0,0,1,0,0,0,0,0,0], 2),
+            ("Worked",   [1,0,1,0,0,0,0,0,1,0,0,0,0,0,0], 3),
+        ],
+        "Plus": [
+            ("Just",     [1,1,1,1,1,1,1,0,0,0,0,1,0,0,0], 8),
+            ("Insights", [1,1,1,1,1,1,1,1,0,0,0,1,0,0,0], 9),
+            ("Olympiad", [1,1,1,1,1,1,0,1,0,0,0,0,0,0,0], 7),
+            ("JustAns",  [1,1,1,1,1,1,0,1,1,0,0,0,0,0,0], 8),
+            ("Worked",   [1,1,1,1,1,1,0,1,0,0,0,1,0,0,0], 8),
+        ],
+        "Gemini": [
+            ("Just",     [1,1,1,1,1,1,0,1,1,0,0,0,0,0,0], 8),
+            ("Insights", [1,1,1,1,1,1,0,0,0,0,0,0,0,0,0], 6),
+            ("Olympiad", [1,1,1,1,1,1,0,0,1,0,0,0,0,0,0], 7),
+            ("JustAns",  [1,0,0,1,1,1,0,0,0,0,0,0,0,0,0], 4),
+            ("Worked",   [1,0,1,0,1,0,0,0,0,0,0,0,0,0,0], 3),
+        ],
+    },
+    "2025 AIME II": {
+        "Free": [
+            ("Just",     [1,0,0,1,0,0,0,0,0,0,0,0,0,0,0], 2),
+            ("Insights", [1,0,1,0,0,0,0,1,0,0,0,0,0,0,0], 3),
+            ("Olympiad", [1,0,0,0,1,0,0,0,0,0,0,0,0,0,0], 2),
+            ("JustAns",  [1,0,0,1,0,1,0,0,0,0,0,0,0,0,0], 3),
+            ("Worked",   [1,0,1,0,0,0,0,0,1,0,0,0,0,0,0], 3),
+        ],
+        "Plus": [
+            ("Just",     [1,1,1,1,1,1,1,0,1,1,0,1,0,0,0],10),
+            ("Insights", [1,1,1,1,1,1,1,1,1,0,0,0,0,0,0], 9),
+            ("Olympiad", [1,1,1,1,1,1,0,1,1,0,1,0,0,0,0], 9),
+            ("JustAns",  [1,1,1,1,1,1,1,1,1,0,1,0,0,0,0],10),
+            ("Worked",   [1,1,1,1,1,1,1,0,1,0,1,0,0,0,0], 9),
+        ],
+        "Gemini": [
+            ("Just",     [1,1,1,1,1,0,1,1,0,1,1,0,0,0,0], 9),
+            ("Insights", [1,1,1,1,1,0,1,1,1,0,0,0,0,0,0], 8),
+            ("Olympiad", [1,1,1,1,0,0,1,1,1,0,0,0,0,0,0], 7),
+            ("JustAns",  [1,1,1,1,1,0,1,1,0,0,0,0,0,0,0], 7),
+            ("Worked",   [1,1,1,0,1,1,1,0,1,0,0,0,0,0,0], 7),
+        ],
+    },
+    "2024 AIME I": {
+        "Free": [
+            ("Just",     [1,1,0,0,0,0,1,0,0,0,0,0,0,0,0], 3),
+            ("Insights", [1,0,0,1,0,1,0,0,1,0,0,0,0,0,0], 4),
+            ("Olympiad", [1,0,0,0,1,0,0,0,0,0,0,0,0,0,0], 2),
+            ("JustAns",  [1,0,0,0,0,0,0,1,0,0,1,0,0,0,0], 3),
+            ("Worked",   [1,0,1,0,0,1,1,0,0,0,0,0,0,0,0], 4),
+        ],
+        "Plus": [
+            ("Just",     [1,1,1,1,1,1,1,1,0,1,0,1,0,0,0],10),
+            ("Insights", [1,1,1,1,1,1,1,1,1,1,0,0,0,0,0],10),
+            ("Olympiad", [1,1,1,1,1,0,1,1,0,1,0,0,0,0,0], 8),
+            ("JustAns",  [1,1,1,1,1,1,1,1,0,0,1,0,0,0,0], 9),
+            ("Worked",   [1,1,1,1,1,1,1,1,1,1,0,1,0,0,0],11),
+        ],
+        "Gemini": [
+            ("Just",     [1,1,1,1,1,1,0,1,1,1,0,0,0,0,0], 9),
+            ("Insights", [1,1,1,1,1,0,1,1,0,0,0,0,0,0,0], 7),
+            ("Olympiad", [1,1,1,1,0,1,1,1,1,0,0,0,0,0,0], 8),
+            ("JustAns",  [1,1,1,1,1,0,1,0,1,1,0,0,0,0,0], 8),
+            ("Worked",   [1,1,1,1,1,0,1,1,0,0,0,0,0,0,0], 7),
+        ],
+    },
+    "2024 AIME II": {
+        "Free": [
+            ("Just",     [1,0,0,0,0,1,0,0,0,0,0,0,0,0,0], 2),
+            ("Insights", [1,0,0,1,0,0,0,1,0,0,0,0,0,0,0], 3),
+            ("Olympiad", [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0], 1),
+            ("JustAns",  [1,0,0,1,0,0,1,0,0,0,0,0,0,0,0], 3),
+            ("Worked",   [1,0,0,0,0,1,0,0,0,0,0,0,0,0,0], 2),
+        ],
+        "Plus": [
+            ("Just",     [1,1,1,1,1,1,1,1,0,0,1,0,0,0,0], 9),
+            ("Insights", [1,1,1,1,1,1,1,1,1,0,1,0,0,0,0],10),
+            ("Olympiad", [1,1,1,1,1,1,0,1,1,0,0,0,0,0,0], 8),
+            ("JustAns",  [1,1,1,1,1,1,1,0,1,1,0,0,0,0,0], 9),
+            ("Worked",   [1,1,1,1,1,1,1,0,1,0,0,0,0,0,0], 8),
+        ],
+        "Gemini": [
+            ("Just",     [1,1,1,1,1,0,1,1,0,1,1,0,0,0,0], 9),
+            ("Insights", [1,1,1,1,1,0,1,1,1,0,0,0,0,0,0], 8),
+            ("Olympiad", [1,1,1,0,1,0,1,1,1,0,0,0,0,0,0], 7),
+            ("JustAns",  [1,1,1,1,1,0,1,1,0,1,0,0,0,0,0], 8),
+            ("Worked",   [1,0,1,0,1,1,1,0,1,1,0,0,0,0,0], 7),
+        ],
+    },
 }
 
-prompt_styles = [
-    "Just the Problem",
-    "Intuition & Insights",
-    "Olympiad Problem & Solution",
-    "AIME Problem & Just Answer",
-    "AIME Problem & Worked Solution",
-]
+MODELS = ["Free", "Plus", "Gemini"]
+STYLES = ["Just", "Insights", "Olympiad", "JustAns", "Worked"]
+EXAMS  = list(DATA.keys())
 
-# Wrap the raw lists into dictionary format for cleaner access
-formatted_llm_data = {
-    model_name: {
-        style: llm_accuracy_by_prompt[model_name][i]
-        for i, style in enumerate(prompt_styles)
-    }
-    for model_name in llm_accuracy_by_prompt
-}
+# ---------------------------
+# 2) Basic validation
+# ---------------------------
+# Confirm each vector’s sum matches the provided score.
+bad = []
+for exam, models in DATA.items():
+    for model, rows in models.items():
+        for style, vec, score in rows:
+            s = sum(vec)
+            if s != score:
+                bad.append((exam, model, style, s, score))
 
-# Function to compare two prompt styles using McNemar's Test
-def compare_prompt_styles(model_name, baseline_prompt, test_prompt):
-    """Constructs contingency table for McNemar’s test between two prompt types."""
-    base = formatted_llm_data[model_name][baseline_prompt]
-    test = formatted_llm_data[model_name][test_prompt]
-    table = np.zeros((2, 2), dtype=int)
+if bad:
+    print("MISMATCH FOUND — STOPPING. The following (sum, provided) disagree:")
+    for row in bad:
+        print(row)
+    sys.exit(1)
 
+# ---------------------------
+# 3) Small helpers
+# ---------------------------
+def mcnemar_table(base, test):
+    """
+    Build the 2×2 table for McNemar:
+        [[both wrong, baseline wrong & test right],
+         [baseline right & test wrong, both right]]
+    """
+    table = np.zeros((2,2), dtype=int)
     for b, t in zip(base, test):
         if b == 1 and t == 1:
-            table[1, 1] += 1  # Both correct
-        elif b == 1:
-            table[1, 0] += 1  # Baseline correct, test wrong
-        elif t == 1:
-            table[0, 1] += 1  # Test correct, baseline wrong
+            table[1,1] += 1
+        elif b == 1 and t == 0:
+            table[1,0] += 1  # t->b
+        elif b == 0 and t == 1:
+            table[0,1] += 1  # b->t
         else:
-            table[0, 0] += 1  # Both wrong
+            table[0,0] += 1
+    return table
 
-    if table[0, 1] + table[1, 0] == 0:
-        return None, 1.0  # No discordant pairs
+def mcnemar_or(table):
+    """Simple direction indicator: OR = (b→t) / (t→b)."""
+    b_to_t = table[0,1]
+    t_to_b = table[1,0]
+    if b_to_t == 0 and t_to_b == 0:
+        return None
+    if t_to_b == 0:
+        return float('inf')
+    return b_to_t / t_to_b
 
-    result = mcnemar(table, exact=True)
-    return result.statistic, result.pvalue
+# ---------------------------
+# 4) Build pooled matrices
+# ---------------------------
+# pooled[model][style] → 60-length list (4×15) for that model/style.
+pooled = {m: {s: [] for s in STYLES} for m in MODELS}
+for exam in EXAMS:
+    for m in MODELS:
+        for (style, vec, _) in DATA[exam][m]:
+            pooled[m][style].extend(vec)
 
-# Loop through each LLM and run McNemar’s Test for each alternative prompt style
-pairwise_test_results = {}
-for model_name in formatted_llm_data:
-    pairwise_test_results[model_name] = {}
-    for alt_prompt in prompt_styles:
-        if alt_prompt == "Just the Problem":
-            continue
-        stat, p = compare_prompt_styles(model_name, "Just the Problem", alt_prompt)
-        pairwise_test_results[model_name][alt_prompt] = {"stat": stat, "p": p}
+# Convert to arrays shaped (items × styles) = (60 × 5).
+pooled_arrays = {
+    m: np.array([pooled[m][s] for s in STYLES]).T
+    for m in MODELS
+}
 
+# ---------------------------
+# 5) Cochran’s Q (pooled)
+# ---------------------------
+print("\nCochran’s Q across 5 styles (pooled n=60 per model):")
+q_results = {}
+for m in MODELS:
+    res = cochrans_q(pooled_arrays[m])
+    q_results[m] = (res.statistic, res.pvalue)
+    print(f"  {m:>6} — Q = {res.statistic:.4f}, p = {res.pvalue:.6f}")
 
-# Section 3: Multiple Hypothesis Correction (Bonferroni)
+# ---------------------------
+# 6) McNemar vs baseline + BH
+# ---------------------------
+print("\nMcNemar vs Baseline (pooled), BH-adjusted within model:")
+for m in MODELS:
+    base = pooled_arrays[m][:, 0]  # "Just"
+    results = []
+    for j, style in enumerate(STYLES[1:], start=1):
+        test = pooled_arrays[m][:, j]
+        tab = mcnemar_table(base, test)
+        res = mcnemar(tab, exact=True)
+        results.append({
+            "style": style,
+            "b_to_t": int(tab[0,1]),
+            "t_to_b": int(tab[1,0]),
+            "both0":  int(tab[0,0]),
+            "both1":  int(tab[1,1]),
+            "stat":   res.statistic,
+            "p":      res.pvalue,
+            "or":     mcnemar_or(tab),
+        })
 
+    # BH on the 4 p-values for this model
+    raw_p = [r["p"] for r in results]
+    reject, p_adj, _, _ = multipletests(raw_p, alpha=0.05, method="fdr_bh")
+    for r, padj, rej in zip(results, p_adj, reject):
+        r["p_bh"] = padj
+        r["reject_bh"] = bool(rej)
 
-# Applying correction across all pairwise comparisons within each LLM
-for model_name in pairwise_test_results:
-    raw_p_vals = [res["p"] for res in pairwise_test_results[model_name].values()]
-    reject, corrected, _, _ = multipletests(raw_p_vals, alpha=0.05, method="bonferroni")
+    print(f"\n  {m}:")
+    for r in results:
+        print(f"    {r['style']:>10} — b→t={r['b_to_t']:2d}, t→b={r['t_to_b']:2d}, "
+              f"both0={r['both0']:2d}, both1={r['both1']:2d}, "
+              f"OR={r['or']}, p={r['p']:.6f}, BH p={r['p_bh']:.6f}, reject={r['reject_bh']}")
 
-    for (prompt, res), p_corr, r in zip(pairwise_test_results[model_name].items(), corrected, reject):
-        res["p_corrected"] = p_corr
-        res["reject_null"] = r
+# ---------------------------
+# 7) Per-exam heterogeneity
+# ---------------------------
+print("\nPer-exam McNemar (style vs baseline): directional check")
+for m in MODELS:
+    print(f"\n  {m}:")
+    for style in STYLES[1:]:
+        print(f"    {style}:")
+        for exam in EXAMS:
+            # look up this exam’s vectors
+            lookup = {name: vec for (name, vec, _) in DATA[exam][m]}
+            base = lookup["Just"]
+            test = lookup[style]
+            tab  = mcnemar_table(base, test)
+            res  = mcnemar(tab, exact=True)
+            print(f"      {exam:11s} — b→t={tab[0,1]}, t→b={tab[1,0]}, "
+                  f"OR={mcnemar_or(tab)}, p={res.pvalue:.4f}")
 
+print("\nDone.")
 
-# Section 4: Print Summary
-
-
-print("\nMcNemar’s Test Results with Bonferroni Correction:\n")
-for model_name, results in pairwise_test_results.items():
-    print(f"Model: {model_name}")
-    for prompt, res in results.items():
-        stat_str = "N/A" if res["stat"] is None else f"{res['stat']:.4f}"
-        print(f"  {prompt} — Stat: {stat_str}, Raw p: {res['p']:.4f}, Corrected p: {res['p_corrected']:.4f}, Reject Null: {res['reject_null']}")
-    print()
